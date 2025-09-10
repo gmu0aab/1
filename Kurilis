@@ -1,0 +1,350 @@
+import React, { useMemo, useState } from "react";
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Badge } from "@/components/ui/badge";
+import { Textarea } from "@/components/ui/textarea";
+import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from "@/components/ui/select";
+import { AlertTriangle, CheckCircle2, Upload, Filter, BarChart3 } from "lucide-react";
+
+// === Дашборд остаточных работ (строительство) — MVP ===
+// Как пользоваться:
+// 1) Вкладка "Данные" — вставьте JSON из Excel/Google Sheet (см. структуру ниже) или мини-образец.
+// 2) Вкладка "Объекты" — список со статусами, автоматическая подсветка отстающих.
+// 3) Вкладка "Виды работ" — детализация по каждому виду (электрика/кровля/благоустройство и т.п.).
+// 4) Пороговые настройки в THRESHOLDS.
+
+// ==== Пороговые настройки (меняются при необходимости) ====
+const THRESHOLDS = {
+  // объект считается отстающим, если факт < план - допуск
+  planLagPct: 5, // % допуск от плана
+  // и/или если остаток > этого порога
+  remainingCriticalPct: 20, // %
+  // и/или если просрочен срок завершения
+};
+
+// ==== Пример структуры данных ====
+// objects = [{
+//   id: "OBJ-001",
+//   name: "Школа на 600 мест",
+//   district: "Сарыағаш",
+//   customer: "УКС",
+//   contractor: "ТОО Строй",
+//   start: "2025-04-01",
+//   end: "2025-11-30",
+//   capex: 2500, // млн тг
+//   physReady: 78, // %
+//   finReady: 72 // %
+// }]
+// remaining = [{
+//   objectId: "OBJ-001",
+//   date: "2025-09-09",
+//   section: "Инженерные сети",
+//   workType: "Электрика",
+//   planned: 100, fact: 70, unit: "%",
+//   remaining: 30, // auto-расчёт дозволен
+//   leftoverCost: 120, // млн тг
+//   owner: "Субподряд ТОО Электро",
+//   due: "2025-10-10",
+//   status: "в работе"
+// }]
+
+const SAMPLE = {
+  objects: [
+    { id: "OBJ-001", name: "Школа на 600 мест", district: "Сарыағаш", customer: "УКС", contractor: "ТОО Строй", start: "2025-04-01", end: "2025-11-30", capex: 2500, physReady: 78, finReady: 72 },
+    { id: "OBJ-002", name: "Поликлиника 250 посещений", district: "Кентау", customer: "УКС", contractor: "ТОО МедСтрой", start: "2025-03-15", end: "2025-10-15", capex: 1800, physReady: 60, finReady: 55 },
+    { id: "OBJ-003", name: "Благоустройство парка", district: "Түркістан", customer: "Акимат", contractor: "ТОО Ландшафт", start: "2025-05-01", end: "2025-09-25", capex: 600, physReady: 84, finReady: 80 },
+  ],
+  remaining: [
+    { objectId: "OBJ-001", date: "2025-09-09", section: "Инженерные сети", workType: "Электрика", planned: 80, fact: 60, unit: "%", remaining: 20, leftoverCost: 65, owner: "Электро-Суб", due: "2025-10-10", status: "в работе" },
+    { objectId: "OBJ-001", date: "2025-09-09", section: "Отделка", workType: "Внутренняя отделка", planned: 85, fact: 70, unit: "%", remaining: 15, leftoverCost: 90, owner: "ОтделСтрой", due: "2025-10-25", status: "в работе" },
+    { objectId: "OBJ-002", date: "2025-09-09", section: "Корпус", workType: "Кровля", planned: 90, fact: 62, unit: "%", remaining: 28, leftoverCost: 110, owner: "КровляСуб", due: "2025-09-28", status: "в работе" },
+    { objectId: "OBJ-002", date: "2025-09-09", section: "Благоустройство", workType: "Асфальтирование", planned: 70, fact: 40, unit: "%", remaining: 30, leftoverCost: 55, owner: "ДорСуб", due: "2025-10-05", status: "не начато" },
+    { objectId: "OBJ-003", date: "2025-09-09", section: "МАФ/Ландшафт", workType: "Озеленение", planned: 88, fact: 82, unit: "%", remaining: 6, leftoverCost: 12, owner: "ЗеленСтрой", due: "2025-09-20", status: "в работе" },
+  ],
+};
+
+function kFmt(n?: number) {
+  if (n === undefined || n === null) return "—";
+  return new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 }).format(n);
+}
+
+function isPast(dateStr?: string) {
+  if (!dateStr) return false;
+  const d = new Date(dateStr + "T00:00:00");
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  return d.getTime() < today.getTime();
+}
+
+function statusForRow(row) {
+  const lagByPlan = (row.planned ?? 0) - (row.fact ?? 0);
+  const lagPct = (lagByPlan > 0 && row.planned) ? (lagByPlan / row.planned) * 100 : 0;
+  const remainingPct = (row.unit === "%" && row.remaining !== undefined) ? row.remaining : null;
+  const lagPlan = lagPct > THRESHOLDS.planLagPct;
+  const lagRemain = remainingPct !== null ? remainingPct > THRESHOLDS.remainingCriticalPct : false;
+  const overdue = isPast(row.due) && (row.status !== "завершено");
+
+  if (overdue || lagRemain || lagPlan) return "lag"; // отстаёт
+  return "ok";
+}
+
+function Pill({ label, tone = "default" }) {
+  const tones = {
+    default: "bg-gray-100 text-gray-700",
+    ok: "bg-green-100 text-green-700",
+    lag: "bg-red-100 text-red-700",
+  };
+  return <span className={`px-2 py-1 rounded-2xl text-xs ${tones[tone]}`}>{label}</span>;
+}
+
+export default function ResidualWorksDashboard() {
+  const [raw, setRaw] = useState("");
+  const [data, setData] = useState(SAMPLE);
+  const [district, setDistrict] = useState<string | undefined>(undefined);
+  const [contractor, setContractor] = useState<string | undefined>(undefined);
+  const [search, setSearch] = useState("");
+
+  const districts = useMemo(() => Array.from(new Set(data.objects.map(o => o.district))).sort(), [data]);
+  const contractors = useMemo(() => Array.from(new Set(data.objects.map(o => o.contractor))).sort(), [data]);
+
+  const objectsFiltered = useMemo(() => {
+    return data.objects.filter(o => {
+      const byDistrict = !district || o.district === district;
+      const byContractor = !contractor || o.contractor === contractor;
+      const hay = `${o.name} ${o.district} ${o.contractor}`.toLowerCase();
+      const bySearch = hay.includes(search.toLowerCase());
+      return byDistrict && byContractor && bySearch;
+    });
+  }, [data, district, contractor, search]);
+
+  const remainingByObject = useMemo(() => {
+    const map: Record<string, any[]> = {};
+    data.remaining.forEach(r => {
+      if (district || contractor) {
+        const obj = data.objects.find(o => o.id === r.objectId);
+        if (!obj) return;
+        if (district && obj.district !== district) return;
+        if (contractor && obj.contractor !== contractor) return;
+      }
+      (map[r.objectId] ||= []).push(r);
+    });
+    return map;
+  }, [data, district, contractor]);
+
+  const kpis = useMemo(() => {
+    const objs = objectsFiltered;
+    const total = objs.length;
+    const avgPhys = total ? objs.reduce((s,o) => s + (o.physReady || 0), 0) / total : 0;
+    let sumLeftover = 0;
+    objs.forEach(o => {
+      (remainingByObject[o.id] || []).forEach(r => { sumLeftover += (r.leftoverCost || 0); });
+    });
+
+    let lagObjects = 0;
+    objs.forEach(o => {
+      const list = remainingByObject[o.id] || [];
+      const hasLag = list.some(r => statusForRow(r) === "lag");
+      if (hasLag) lagObjects += 1;
+    });
+
+    return {
+      total,
+      avgPhys: Math.round(avgPhys),
+      sumLeftover,
+      lagObjects,
+    };
+  }, [objectsFiltered, remainingByObject]);
+
+  const objectsTable = useMemo(() => {
+    return objectsFiltered.map(o => {
+      const works = remainingByObject[o.id] || [];
+      const sumLeftover = works.reduce((s, r) => s + (r.leftoverCost || 0), 0);
+      const lag = works.some(r => statusForRow(r) === "lag");
+      const overdue = works.some(r => isPast(r.due));
+      return { ...o, sumLeftover, lag, overdue };
+    }).sort((a,b) => (b.lag === a.lag ? b.sumLeftover - a.sumLeftover : (b.lag ? 1 : -1)));
+  }, [objectsFiltered, remainingByObject]);
+
+  const worksTable = useMemo(() => {
+    const rows: any[] = [];
+    Object.entries(remainingByObject).forEach(([objId, items]) => {
+      const o = data.objects.find(x => x.id === objId);
+      items.forEach(r => {
+        const st = statusForRow(r);
+        rows.push({
+          object: o?.name || objId,
+          district: o?.district || "",
+          contractor: o?.contractor || "",
+          section: r.section,
+          workType: r.workType,
+          planned: r.planned,
+          fact: r.fact,
+          remaining: r.remaining ?? (r.planned - r.fact),
+          unit: r.unit,
+          leftoverCost: r.leftoverCost,
+          due: r.due,
+          status: r.status,
+          flag: st,
+        });
+      });
+    });
+    // сортируем: сначала отстающие, затем по стоимости остатка
+    return rows.sort((a,b) => (a.flag === b.flag ? (b.leftoverCost||0) - (a.leftoverCost||0) : (a.flag === "lag" ? -1 : 1)));
+  }, [remainingByObject, data.objects]);
+
+  function loadJson() {
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed.objects || !parsed.remaining) throw new Error("Нужно поля objects и remaining");
+      setData(parsed);
+    } catch (e: any) {
+      alert("Ошибка JSON: " + e.message);
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-4 md:p-8 space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl md:text-3xl font-semibold">Остаточные работы (стройка) — дашборд</h1>
+          <div className="text-sm text-gray-500">MVP • авто-подсветка отстающих по плану/остатку/сроку</div>
+        </div>
+        <div className="flex gap-2 w-full md:w-auto">
+          <Input placeholder="Поиск по объектам/подрядчику/району" value={search} onChange={(e)=>setSearch(e.target.value)} />
+        </div>
+      </div>
+
+      {/* KPI */}
+      <div className="grid md:grid-cols-4 gap-3">
+        <Card className="rounded-2xl shadow-sm"><CardContent className="p-4"><div className="text-sm text-gray-500">Объектов</div><div className="text-2xl font-semibold">{kpis.total}</div></CardContent></Card>
+        <Card className="rounded-2xl shadow-sm"><CardContent className="p-4"><div className="text-sm text-gray-500">Средняя физ. готовность</div><div className="text-2xl font-semibold">{kpis.avgPhys}%</div></CardContent></Card>
+        <Card className="rounded-2xl shadow-sm"><CardContent className="p-4"><div className="text-sm text-gray-500">Сумма остатка</div><div className="text-2xl font-semibold">{kFmt(kpis.sumLeftover)} млн тг</div></CardContent></Card>
+        <Card className="rounded-2xl shadow-sm"><CardContent className="p-4"><div className="text-sm text-gray-500">Проблемных объектов</div><div className="text-2xl font-semibold">{kpis.lagObjects}</div></CardContent></Card>
+      </div>
+
+      <Tabs defaultValue="objects" className="mt-4">
+        <TabsList>
+          <TabsTrigger value="objects"><BarChart3 className="w-4 h-4 mr-1"/>Объекты</TabsTrigger>
+          <TabsTrigger value="works"><Filter className="w-4 h-4 mr-1"/>Виды работ</TabsTrigger>
+          <TabsTrigger value="data"><Upload className="w-4 h-4 mr-1"/>Данные</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="objects" className="mt-3 space-y-3">
+          <div className="flex flex-col md:flex-row gap-2">
+            <Select onValueChange={setDistrict}>
+              <SelectTrigger className="w-full md:w-60"><SelectValue placeholder="Фильтр: Район"/></SelectTrigger>
+              <SelectContent>
+                {districts.map(d => <SelectItem key={d} value={d}>{d}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            <Select onValueChange={setContractor}>
+              <SelectTrigger className="w-full md:w-60"><SelectValue placeholder="Фильтр: Подрядчик"/></SelectTrigger>
+              <SelectContent>
+                {contractors.map(c => <SelectItem key={c} value={c}>{c}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            <Button variant="outline" onClick={()=>{setDistrict(undefined); setContractor(undefined);}}>Сбросить фильтры</Button>
+          </div>
+
+          <Card className="rounded-2xl shadow-sm">
+            <CardContent className="p-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Объект</TableHead>
+                    <TableHead>Район</TableHead>
+                    <TableHead>Подрядчик</TableHead>
+                    <TableHead>Физ. готовность</TableHead>
+                    <TableHead>Сумма остатка, млн тг</TableHead>
+                    <TableHead>Крайний срок</TableHead>
+                    <TableHead>Статус</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {objectsTable.map((o, i) => (
+                    <TableRow key={i} className={o.lag || o.overdue ? "bg-red-50" : ""}>
+                      <TableCell className="font-medium">{o.name}</TableCell>
+                      <TableCell>{o.district}</TableCell>
+                      <TableCell>{o.contractor}</TableCell>
+                      <TableCell>{o.physReady}%</TableCell>
+                      <TableCell>{kFmt(o.sumLeftover)}</TableCell>
+                      <TableCell>{o.end}</TableCell>
+                      <TableCell>
+                        {o.lag || o.overdue ? <Pill label="Отстаёт" tone="lag"/> : <Pill label="Ок" tone="ok"/>}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="works" className="mt-3">
+          <Card className="rounded-2xl shadow-sm">
+            <CardContent className="p-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Объект</TableHead>
+                    <TableHead>Район</TableHead>
+                    <TableHead>Подрядчик</TableHead>
+                    <TableHead>Раздел</TableHead>
+                    <TableHead>Вид работ</TableHead>
+                    <TableHead>План, %</TableHead>
+                    <TableHead>Факт, %</TableHead>
+                    <TableHead>Остаток</TableHead>
+                    <TableHead>Ед.</TableHead>
+                    <TableHead>Остаток, млн тг</TableHead>
+                    <TableHead>Срок</TableHead>
+                    <TableHead>Флаг</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {worksTable.map((r, i) => (
+                    <TableRow key={i} className={r.flag === "lag" ? "bg-red-50" : ""}>
+                      <TableCell className="font-medium">{r.object}</TableCell>
+                      <TableCell>{r.district}</TableCell>
+                      <TableCell>{r.contractor}</TableCell>
+                      <TableCell>{r.section}</TableCell>
+                      <TableCell>{r.workType}</TableCell>
+                      <TableCell>{r.planned ?? "—"}</TableCell>
+                      <TableCell>{r.fact ?? "—"}</TableCell>
+                      <TableCell>{r.remaining ?? "—"}</TableCell>
+                      <TableCell>{r.unit || "%"}</TableCell>
+                      <TableCell>{kFmt(r.leftoverCost)}</TableCell>
+                      <TableCell>{r.due || "—"}</TableCell>
+                      <TableCell>
+                        {r.flag === "lag" ? <Pill label="Отстаёт" tone="lag"/> : <Pill label="Ок" tone="ok"/>}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="data" className="mt-3">
+          <Card className="rounded-2xl shadow-sm">
+            <CardContent className="p-4 space-y-2">
+              <div className="text-sm text-gray-600">Вставьте JSON со структурами <code>objects</code> и <code>remaining</code> или используйте образец ниже:</div>
+              <Textarea rows={8} value={raw} onChange={(e)=>setRaw(e.target.value)} placeholder={JSON.stringify(SAMPLE, null, 2)} />
+              <div className="flex gap-2">
+                <Button onClick={loadJson}><Upload className="w-4 h-4 mr-1"/>Загрузить JSON</Button>
+                <Button variant="outline" onClick={()=>setData(SAMPLE)}>Загрузить образец</Button>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
+
+      <div className="text-xs text-gray-400">
+        Правила подсветки: красным считается вид/объект если: (1) факт отстаёт от плана более чем на {THRESHOLDS.planLagPct}% ; или (2) остаток по виду > {THRESHOLDS.remainingCriticalPct}% ; или (3) просрочен срок завершения.
+      </div>
+    </div>
+  );
+}
